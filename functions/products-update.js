@@ -27,6 +27,7 @@ function cityFromVariant(variant) {
     const mf = (variant?.metafields || []).find(m => m.namespace === ns && m.key === key);
     if (mf?.value) return normalizeCityName(mf.value);
   }
+  // fallback: use variant.title (e.g., "Jeddah" or "Jeddah / Large")
   return normalizeCityName(variant?.title);
 }
 function cityCollectionGid(city) {
@@ -49,7 +50,6 @@ function promoByMetafield(variant) {
   const ns = process.env.PROMO_METAFIELD_NAMESPACE || 'custom';
   const key = process.env.PROMO_METAFIELD_KEY || 'promo_active';
   const mf = (variant?.metafields || []).find(m => m.namespace === ns && m.key === key);
-  // Accept “true”, "1", true
   const val = String(mf?.value ?? '').toLowerCase().trim();
   const promo = val === 'true' || val === '1';
   return { promo, price: toNumber(variant.price), cap: toNumber(variant.compare_at_price) };
@@ -64,7 +64,6 @@ async function addToCollection(shop, token, collectionId, productId) {
   const query = `#graphql
     mutation AddToCollection($id: ID!, $pids: [ID!]!) {
       collectionAddProducts(id: $id, productIds: $pids) {
-        job { id }
         userErrors { field message }
       }
     }`;
@@ -74,7 +73,6 @@ async function removeFromCollection(shop, token, collectionId, productId) {
   const query = `#graphql
     mutation RemoveFromCollection($id: ID!, $pids: [ID!]!) {
       collectionRemoveProducts(id: $id, productIds: $pids) {
-        job { id }
         userErrors { field message }
       }
     }`;
@@ -97,12 +95,15 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: 'Missing env vars SHOPIFY_SHOP / SHOPIFY_ADMIN_ACCESS_TOKEN / SHOPIFY_API_SECRET' };
     }
 
-    // HMAC (bypass only for testing)
+    // --- HMAC verification (with optional bypass for testing) ---
     if (process.env.SKIP_HMAC === '1') {
       console.warn('WARNING: HMAC verification bypassed (testing mode: SKIP_HMAC=1)');
     } else {
-      const ok = require('./utils/verify.js').verifyShopifyWebhookHmac(rawBody, headers, apiSecret);
-      if (!ok) return { statusCode: 200, body: 'Invalid webhook signature' };
+      const ok = verifyShopifyWebhookHmac(rawBody, headers, apiSecret);
+      if (!ok) {
+        // 200 to avoid noisy retries while debugging; switch to 401 if you prefer
+        return { statusCode: 200, body: 'Invalid webhook signature' };
+      }
     }
 
     const product = JSON.parse(rawBody);
@@ -110,7 +111,9 @@ exports.handler = async (event) => {
     const pGid = productGid(productIdNum);
     const variants = Array.isArray(product?.variants) ? product.variants : [];
 
-    if (verbose) console.log('Incoming product', productIdNum, 'variant titles:', variants.map(v => v.title));
+    if (verbose) {
+      console.log('Incoming product', productIdNum, 'variant titles:', variants.map(v => v.title));
+    }
 
     const targetCities = ['jeddah', 'riyadh', 'dammam'];
     const decisions = [];
@@ -120,14 +123,17 @@ exports.handler = async (event) => {
       if (!targetCities.includes(city)) continue;
 
       let res = { promo: false, price: NaN, cap: NaN };
-      if (promoSource === 'price')      res = promoByPrice(v);
+      if (promoSource === 'price')         res = promoByPrice(v);
       else if (promoSource === 'metafield') res = promoByMetafield(v);
-      else if (promoSource === 'tag')   res = promoByTag(product, city);
+      else if (promoSource === 'tag')       res = promoByTag(product, city);
 
       if (verbose) console.log(`Variant ${v.id} (${city}) price=${res.price} cap=${res.cap} promo=${res.promo}`);
 
       const collectionId = cityCollectionGid(city);
-      if (!collectionId) continue;
+      if (!collectionId) {
+        if (verbose) console.warn(`No collection GID env var for city=${city}. Expected one of: DEALS_JEDDAH_COLLECTION_GID / DEALS_RIYADH_COLLECTION_GID / DEALS_DAMMAM_COLLECTION_GID`);
+        continue;
+      }
 
       decisions.push({
         city,
@@ -144,8 +150,17 @@ exports.handler = async (event) => {
     const results = [];
     for (const d of decisions) {
       try {
-        if (d.action === 'add') await addToCollection(shop, token, d.collectionId, pGid);
-        else await removeFromCollection(shop, token, d.collectionId, pGid);
+        if (d.action === 'add') {
+          const r = await addToCollection(shop, token, d.collectionId, pGid);
+          if (verbose && r?.data?.collectionAddProducts?.userErrors?.length) {
+            console.error('Add userErrors:', r.data.collectionAddProducts.userErrors);
+          }
+        } else {
+          const r = await removeFromCollection(shop, token, d.collectionId, pGid);
+          if (verbose && r?.data?.collectionRemoveProducts?.userErrors?.length) {
+            console.error('Remove userErrors:', r.data.collectionRemoveProducts.userErrors);
+          }
+        }
         results.push({ city: d.city, action: d.action, ok: true });
       } catch (e) {
         console.error('Mutation error for', d.city, d.action, e.response || e.message);
