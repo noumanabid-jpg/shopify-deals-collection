@@ -2,7 +2,7 @@
 const { verifyShopifyWebhookHmac } = require('./utils/verify.js');
 const { shopifyGraphql } = require('./utils/shopify.js');
 
-/* ------------------------------ helpers ------------------------------ */
+/* ---------------- helpers ---------------- */
 function toNumber(v) {
   if (v === null || v === undefined || v === '') return NaN;
   const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, ''));
@@ -11,7 +11,6 @@ function toNumber(v) {
 function normalize(s) {
   return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
-// tolerate minor misspellings and composite titles like "Jeddah / 1kg"
 function normalizeCityName(s) {
   const n = normalize(s);
   if (!n) return '';
@@ -28,7 +27,6 @@ function cityFromVariant(variant) {
     const mf = (variant?.metafields || []).find(m => m.namespace === ns && m.key === key);
     if (mf?.value) return normalizeCityName(mf.value);
   }
-  // fallback: use variant.title (can be "Jeddah" or "Jeddah / Large")
   return normalizeCityName(variant?.title);
 }
 function cityCollectionGid(city) {
@@ -39,8 +37,27 @@ function cityCollectionGid(city) {
     default: return null;
   }
 }
-function productGid(numericId) {
-  return `gid://shopify/Product/${numericId}`;
+function productGid(idNum) { return `gid://shopify/Product/${idNum}`; }
+
+/* promo detectors */
+function promoByPrice(variant) {
+  const price = toNumber(variant.price);
+  const cap   = toNumber(variant.compare_at_price);
+  return { promo: Number.isFinite(price) && Number.isFinite(cap) && cap > price, price, cap };
+}
+function promoByMetafield(variant) {
+  const ns = process.env.PROMO_METAFIELD_NAMESPACE || 'custom';
+  const key = process.env.PROMO_METAFIELD_KEY || 'promo_active';
+  const mf = (variant?.metafields || []).find(m => m.namespace === ns && m.key === key);
+  // Accept “true”, "1", true
+  const val = String(mf?.value ?? '').toLowerCase().trim();
+  const promo = val === 'true' || val === '1';
+  return { promo, price: toNumber(variant.price), cap: toNumber(variant.compare_at_price) };
+}
+function promoByTag(product, city) {
+  const tags = (product.tags || '').toLowerCase();
+  const promo = tags.includes(`deal-${city}`);
+  return { promo, price: NaN, cap: NaN };
 }
 
 async function addToCollection(shop, token, collectionId, productId) {
@@ -64,9 +81,11 @@ async function removeFromCollection(shop, token, collectionId, productId) {
   return shopifyGraphql({ shop, token, query, variables: { id: collectionId, pids: [productId] } });
 }
 
-/* ------------------------------ handler ------------------------------ */
+/* ---------------- handler ---------------- */
 exports.handler = async (event) => {
   const verbose = (process.env.LOG_LEVEL || 'info') === 'debug';
+  const promoSource = (process.env.PROMO_SOURCE || 'price').toLowerCase(); // 'price' | 'metafield' | 'tag'
+
   try {
     const rawBody = event.body || '';
     const headers = event.headers || {};
@@ -78,61 +97,55 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: 'Missing env vars SHOPIFY_SHOP / SHOPIFY_ADMIN_ACCESS_TOKEN / SHOPIFY_API_SECRET' };
     }
 
-    // --- HMAC verification (with optional bypass for testing) ---
+    // HMAC (bypass only for testing)
     if (process.env.SKIP_HMAC === '1') {
       console.warn('WARNING: HMAC verification bypassed (testing mode: SKIP_HMAC=1)');
     } else {
-      const ok = verifyShopifyWebhookHmac(rawBody, headers, apiSecret);
-      if (!ok) {
-        return { statusCode: 200, body: 'Invalid webhook signature' }; // 200 to avoid retries while debugging
-      }
+      const ok = require('./utils/verify.js').verifyShopifyWebhookHmac(rawBody, headers, apiSecret);
+      if (!ok) return { statusCode: 200, body: 'Invalid webhook signature' };
     }
 
-    // Parse Shopify product payload
     const product = JSON.parse(rawBody);
     const productIdNum = product.id;
     const pGid = productGid(productIdNum);
-
     const variants = Array.isArray(product?.variants) ? product.variants : [];
-    if (verbose) {
-      console.log('Incoming product', productIdNum, 'variant titles:', variants.map(v => v.title));
-    }
+
+    if (verbose) console.log('Incoming product', productIdNum, 'variant titles:', variants.map(v => v.title));
 
     const targetCities = ['jeddah', 'riyadh', 'dammam'];
-    const decisions = []; // { city, action: 'add'|'remove', collectionId, price, compare_at_price, variantId }
+    const decisions = [];
 
     for (const v of variants) {
       const city = cityFromVariant(v);
       if (!targetCities.includes(city)) continue;
 
-      const price = toNumber(v.price);
-      const cap = toNumber(v.compare_at_price);
-      const promo = Number.isFinite(price) && Number.isFinite(cap) && cap > price;
+      let res = { promo: false, price: NaN, cap: NaN };
+      if (promoSource === 'price')      res = promoByPrice(v);
+      else if (promoSource === 'metafield') res = promoByMetafield(v);
+      else if (promoSource === 'tag')   res = promoByTag(product, city);
+
+      if (verbose) console.log(`Variant ${v.id} (${city}) price=${res.price} cap=${res.cap} promo=${res.promo}`);
 
       const collectionId = cityCollectionGid(city);
       if (!collectionId) continue;
 
       decisions.push({
         city,
-        action: promo ? 'add' : 'remove',
+        action: res.promo ? 'add' : 'remove',
         collectionId,
-        price,
-        compare_at_price: cap,
+        price: res.price,
+        compare_at_price: res.cap,
         variantId: v.id
       });
     }
 
     if (verbose) console.log('Decisions:', decisions);
 
-    // Execute mutations (idempotent on Shopify’s side)
     const results = [];
     for (const d of decisions) {
       try {
-        if (d.action === 'add') {
-          await addToCollection(shop, token, d.collectionId, pGid);
-        } else {
-          await removeFromCollection(shop, token, d.collectionId, pGid);
-        }
+        if (d.action === 'add') await addToCollection(shop, token, d.collectionId, pGid);
+        else await removeFromCollection(shop, token, d.collectionId, pGid);
         results.push({ city: d.city, action: d.action, ok: true });
       } catch (e) {
         console.error('Mutation error for', d.city, d.action, e.response || e.message);
