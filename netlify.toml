@@ -2,11 +2,8 @@
   directory = "functions"
   node_bundler = "esbuild"
 
-[build]
-  command = ""
-  publish = "public"
-
 [[redirects]]
   from = "/webhooks/*"
   to = "/.netlify/functions/:splat"
   status = 200
+
